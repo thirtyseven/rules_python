@@ -82,6 +82,7 @@ END_UNRELEASED_TEMPLATE
   `true`, a `py_*` target's `pyi_srcs` attribute will be set if any `.pyi` files
   that are associated with the target's `srcs` are present.
   ([#3354](https://github.com/bazel-contrib/rules_python/issues/3354)).
+  ([#2731](https://github.com/bazel-contrib/rules_python/issues/2731) Cache SimpleAPI responses to MODULE.bazel.lock on supported versions
 
 {#v1-8-3}
 ## [1.8.3] - 2026-01-27
