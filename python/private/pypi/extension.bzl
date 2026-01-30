@@ -34,13 +34,29 @@ load(":whl_library.bzl", "whl_library")
 def _simpleapi_cache_to_facts(cache):
     """Convert SimpleAPI cache structs to JSON-serializable dicts for lockfile storage.
 
+    Uses structs.to_dict() from Bazel Skylib to recursively convert nested structs.
+
     Args:
         cache: dict of URL -> struct with sdists, whls, sha256s_by_version
 
     Returns:
         dict of URL -> dict (JSON-serializable)
     """
-    return {url: structs.to_dict(data) for url, data in cache.items()}
+    facts = {}
+    for url, data in cache.items():
+        # Convert the outer struct
+        data_dict = structs.to_dict(data)
+        # Recursively convert nested artifact structs in sdists and whls
+        data_dict["sdists"] = {
+            k: structs.to_dict(v)
+            for k, v in data_dict["sdists"].items()
+        }
+        data_dict["whls"] = {
+            k: structs.to_dict(v)
+            for k, v in data_dict["whls"].items()
+        }
+        facts[url] = data_dict
+    return facts
 
 def _simpleapi_cache_from_facts(facts):
     """Convert facts from lockfile back to structs expected by simpleapi_download.
@@ -51,15 +67,14 @@ def _simpleapi_cache_from_facts(facts):
     Returns:
         dict of URL -> struct (same format as parse_simpleapi_html returns)
     """
-    cache = {}
-    for url, data in facts.items():
-        # Convert dict to struct - need to recursively convert nested dicts
-        cache[url] = struct(
-            sdists = {k: struct(**v) for k, v in data.get("sdists", {}).items()},
-            whls = {k: struct(**v) for k, v in data.get("whls", {}).items()},
-            sha256s_by_version = data.get("sha256s_by_version", {}),
+    return {
+        url: struct(
+            sdists = {k: struct(**v) for k, v in data["sdists"].items()},
+            whls = {k: struct(**v) for k, v in data["whls"].items()},
+            sha256s_by_version = data["sha256s_by_version"],
         )
-    return cache
+        for url, data in facts.items()
+    }
 
 def _whl_mods_impl(whl_mods_dict):
     """Implementation of the pip.whl_mods tag class.
