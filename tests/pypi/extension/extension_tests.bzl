@@ -92,6 +92,7 @@ def _parse_modules(env, enable_pipstar = 0, **kwargs):
             hub_whl_map = subjects.dict,
             whl_libraries = subjects.dict,
             whl_mods = subjects.dict,
+            simpleapi_cache = subjects.dict,
         ),
     )
 
@@ -237,6 +238,89 @@ def _test_build_pipstar_platform(env):
     })
 
 _tests.append(_test_build_pipstar_platform)
+
+def _test_parse_modules_with_simpleapi_facts(env):
+    """Test that parse_modules accepts and returns simpleapi_cache."""
+    module_ctx = _mock_mctx(
+        _mod(
+            name = "my_module",
+            parse = [
+                _parse(
+                    hub_name = "pip",
+                    python_version = "3.11",
+                    requirements_lock = "//:requirements.txt",
+                ),
+            ],
+        ),
+    )
+
+    # Test with pre-existing facts (simulating cache from lockfile)
+    sample_facts = {
+        "https://pypi.org/simple/foo/": {
+            "sdists": {
+                "abc123": {
+                    "filename": "foo-1.0.0.tar.gz",
+                    "version": "1.0.0",
+                    "url": "https://files.pypi.org/foo-1.0.0.tar.gz",
+                    "sha256": "abc123",
+                    "metadata_sha256": "",
+                    "metadata_url": "",
+                    "yanked": False,
+                },
+            },
+            "whls": {},
+            "sha256s_by_version": {"1.0.0": ["abc123"]},
+        },
+    }
+
+    result = _parse_modules(
+        env,
+        module_ctx = module_ctx,
+        simpleapi_facts = sample_facts,
+    )
+
+    # Verify that simpleapi_cache contains the facts
+    cache = result.actual.simpleapi_cache
+    env.expect.that_collection(cache.keys()).contains("https://pypi.org/simple/foo/")
+
+    # Verify that the facts were converted to structs (expected format)
+    foo_data = cache["https://pypi.org/simple/foo/"]
+    env.expect.that_bool(type(foo_data) == "struct").equals(True)
+
+    # Verify the content is preserved
+    env.expect.that_collection(foo_data.sdists.keys()).contains("abc123")
+    sdist = foo_data.sdists["abc123"]
+    env.expect.that_str(sdist.filename).equals("foo-1.0.0.tar.gz")
+    env.expect.that_str(sdist.sha256).equals("abc123")
+
+_tests.append(_test_parse_modules_with_simpleapi_facts)
+
+def _test_backward_compatibility_without_facts(env):
+    """Test that the extension works with older Bazel versions without facts API."""
+    module_ctx = _mock_mctx(
+        _mod(
+            name = "my_module",
+            parse = [
+                _parse(
+                    hub_name = "pip",
+                    python_version = "3.11",
+                    requirements_lock = "//:requirements.txt",
+                ),
+            ],
+        ),
+    )
+
+    # Test that parse_modules works without simpleapi_facts parameter
+    # (simulating older Bazel version)
+    result = _parse_modules(
+        env,
+        module_ctx = module_ctx,
+    )
+
+    # Should still have a simpleapi_cache, just empty
+    env.expect.that_dict(result.actual.simpleapi_cache).contains_exactly({})
+
+_tests.append(_test_backward_compatibility_without_facts)
 
 def extension_test_suite(name):
     """Create the test suite.

@@ -14,6 +14,7 @@
 
 "pip module extension for use with bzlmod"
 
+load("@bazel_skylib//lib:structs.bzl", "structs")
 load("@pythons_hub//:interpreters.bzl", "INTERPRETER_LABELS")
 load("@pythons_hub//:versions.bzl", "MINOR_MAPPING")
 load("@rules_python_internal//:rules_python_config.bzl", rp_config = "config")
@@ -29,6 +30,36 @@ load(":pip_repository_attrs.bzl", "ATTRS")
 load(":platform.bzl", _plat = "platform")
 load(":simpleapi_download.bzl", "simpleapi_download")
 load(":whl_library.bzl", "whl_library")
+
+def _simpleapi_cache_to_facts(cache):
+    """Convert SimpleAPI cache structs to JSON-serializable dicts for lockfile storage.
+
+    Args:
+        cache: dict of URL -> struct with sdists, whls, sha256s_by_version
+
+    Returns:
+        dict of URL -> dict (JSON-serializable)
+    """
+    return {url: structs.to_dict(data) for url, data in cache.items()}
+
+def _simpleapi_cache_from_facts(facts):
+    """Convert facts from lockfile back to structs expected by simpleapi_download.
+
+    Args:
+        facts: dict of URL -> dict (from lockfile)
+
+    Returns:
+        dict of URL -> struct (same format as parse_simpleapi_html returns)
+    """
+    cache = {}
+    for url, data in facts.items():
+        # Convert dict to struct - need to recursively convert nested dicts
+        cache[url] = struct(
+            sdists = {k: struct(**v) for k, v in data.get("sdists", {}).items()},
+            whls = {k: struct(**v) for k, v in data.get("whls", {}).items()},
+            sha256s_by_version = data.get("sha256s_by_version", {}),
+        )
+    return cache
 
 def _whl_mods_impl(whl_mods_dict):
     """Implementation of the pip.whl_mods tag class.
@@ -139,6 +170,7 @@ def parse_modules(
         simpleapi_download = simpleapi_download,
         enable_pipstar = False,
         enable_pipstar_extract = False,
+        simpleapi_facts = {},
         **kwargs):
     """Implementation of parsing the tag classes for the extension and return a struct for registering repositories.
 
@@ -149,6 +181,7 @@ def parse_modules(
             evaluation of the extension.
         enable_pipstar_extract: {type}`bool` a flag to enable dropping Python dependency for
             extracting wheels.
+        simpleapi_facts: {type}`dict` previously cached SimpleAPI metadata from the lockfile.
         _fail: {type}`function` the failure function, mainly for testing.
         **kwargs: Extra arguments passed to the hub_builder.
 
@@ -222,7 +255,10 @@ You cannot use both the additive_build_content and additive_build_content_file a
     # Used to track all the different pip hubs and the spoke pip Python
     # versions.
     pip_hub_map = {}
-    simpleapi_cache = {}
+
+    # Initialize the cache with previously stored facts from the lockfile
+    # This avoids re-downloading immutable PyPI metadata
+    simpleapi_cache = _simpleapi_cache_from_facts(simpleapi_facts)
 
     for mod in module_ctx.modules:
         for pip_attr in mod.tags.parse:
@@ -301,6 +337,7 @@ You cannot use both the additive_build_content and additive_build_content_file a
             }
             for hub_name in hub_whl_map
         },
+        simpleapi_cache = simpleapi_cache,
     )
 
 def _pip_impl(module_ctx):
@@ -369,7 +406,18 @@ def _pip_impl(module_ctx):
         module_ctx: module contents
     """
 
-    mods = parse_modules(module_ctx, enable_pipstar = rp_config.enable_pipstar, enable_pipstar_extract = rp_config.enable_pipstar and rp_config.bazel_8_or_later)
+    # Retrieve previously cached facts from the lockfile
+    # The facts contain immutable PyPI metadata (URLs, hashes) that can be reused
+    # The facts API was introduced in Bazel 8.5.0. For older versions, getattr
+    # returns {} and the extension works without caching (same as first run).
+    facts = getattr(module_ctx, "facts", {})
+
+    mods = parse_modules(
+        module_ctx,
+        enable_pipstar = rp_config.enable_pipstar,
+        enable_pipstar_extract = rp_config.enable_pipstar and rp_config.bazel_8_or_later,
+        simpleapi_facts = facts.get("simpleapi_cache", {}),
+    )
 
     # Build all of the wheel modifications if the tag class is called.
     _whl_mods_impl(mods.whl_mods)
@@ -391,9 +439,17 @@ def _pip_impl(module_ctx):
             groups = mods.hub_group_map.get(hub_name),
         )
 
-    return module_ctx.extension_metadata(
-        reproducible = True,
-    )
+    # Store SimpleAPI metadata in the lockfile for reuse in future evaluations
+    # This avoids re-querying PyPI for immutable package metadata
+    # Only set facts if the API is available (Bazel 8.5.0+). For older versions,
+    # the extension still works correctly, just without persistent caching.
+    extension_metadata = {"reproducible": True}
+    if hasattr(module_ctx, "facts"):
+        extension_metadata["facts"] = {
+            "simpleapi_cache": _simpleapi_cache_to_facts(mods.simpleapi_cache),
+        }
+
+    return module_ctx.extension_metadata(**extension_metadata)
 
 _default_attrs = {
     "arch_name": attr.string(
