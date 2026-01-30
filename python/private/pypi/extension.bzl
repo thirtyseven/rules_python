@@ -31,6 +31,113 @@ load(":platform.bzl", _plat = "platform")
 load(":simpleapi_download.bzl", "simpleapi_download")
 load(":whl_library.bzl", "whl_library")
 
+def _filter_simpleapi_cache_by_usage(cache, whl_libraries):
+    """Filter SimpleAPI cache to only include versions actually used.
+
+    This dramatically reduces MODULE.bazel.lock file size by only caching
+    metadata for package versions that are actually referenced in the
+    requirements lock files, rather than all versions available on PyPI.
+
+    Args:
+        cache: dict of URL -> struct with sdists, whls, sha256s_by_version
+        whl_libraries: dict of repo_name -> args, where args contains
+                       'requirement' field and 'urls' field with wheel info
+
+    Returns:
+        Filtered cache dict with same structure but only used versions
+    """
+    if not cache:
+        return cache
+
+    # Extract (package_name, version) pairs that are actually used
+    # by analyzing whl_libraries
+    used_versions = {}  # {normalized_package_name: set of versions}
+
+    for repo_name, args in whl_libraries.items():
+        # Extract version from the wheel URLs or requirement
+        version = None
+
+        # Try to get version from urls (most reliable)
+        if "urls" in args and args["urls"]:
+            # URLs contain wheel filenames like "package-1.2.3-py3-none-any.whl"
+            url = args["urls"][0]
+            filename = url.split("/")[-1]
+
+            # Parse wheel filename: name-version-...
+            if ".whl" in filename or ".tar.gz" in filename or ".zip" in filename:
+                parts = filename.split("-")
+                if len(parts) >= 2:
+                    # First part is name, second is version
+                    package_name = normalize_name(parts[0])
+                    version = parts[1]
+
+        # Fallback: parse from requirement string (e.g., "package==1.2.3")
+        if not version and "requirement" in args:
+            req = args["requirement"]
+            # Handle formats like: "package==1.2.3", "package>=1.2.3", "package[extras]==1.2.3"
+            # Strip extras
+            if "[" in req:
+                req = req.split("[")[0]
+
+            # Try to extract version
+            for sep in ["==", ">=", "<=", "~=", "!=", ">", "<"]:
+                if sep in req:
+                    parts = req.split(sep)
+                    if len(parts) >= 2:
+                        package_name = normalize_name(parts[0].strip())
+                        version = parts[1].strip().split(",")[0].split(";")[0].strip()
+                    break
+
+        if version and package_name:
+            used_versions.setdefault(package_name, set()).add(version)
+
+    if not used_versions:
+        # If we couldn't extract any versions, return full cache to be safe
+        return cache
+
+    # Filter cache to only include used versions
+    filtered = {}
+    for url, data in cache.items():
+        # Extract package name from URL: https://pypi.org/simple/package-name/
+        url_parts = url.rstrip("/").split("/")
+        if len(url_parts) < 2:
+            continue
+
+        package_name = normalize_name(url_parts[-1])
+
+        if package_name not in used_versions:
+            # Package not used at all, skip entirely
+            continue
+
+        # Filter artifacts to only used versions
+        versions_to_keep = used_versions[package_name]
+
+        filtered_sdists = {
+            sha: artifact
+            for sha, artifact in data.sdists.items()
+            if artifact.version in versions_to_keep
+        }
+        filtered_whls = {
+            sha: artifact
+            for sha, artifact in data.whls.items()
+            if artifact.version in versions_to_keep
+        }
+        filtered_sha256s_by_version = {
+            v: shas
+            for v, shas in data.sha256s_by_version.items()
+            if v in versions_to_keep
+        }
+
+        # Only include this package if we have artifacts for it
+        if filtered_sdists or filtered_whls:
+            filtered[url] = struct(
+                sdists = filtered_sdists,
+                whls = filtered_whls,
+                sha256s_by_version = filtered_sha256s_by_version,
+            )
+
+    return filtered
+
 def _simpleapi_cache_to_facts(cache):
     """Convert SimpleAPI cache structs to JSON-serializable dicts for lockfile storage.
 
@@ -337,6 +444,10 @@ You cannot use both the additive_build_content and additive_build_content_file a
         hub_group_map[hub.name] = out.group_map
         hub_whl_map[hub.name] = out.whl_map
 
+    # Filter simpleapi_cache to only include versions actually used in whl_libraries
+    # This significantly reduces MODULE.bazel.lock size
+    filtered_cache = _filter_simpleapi_cache_by_usage(simpleapi_cache, whl_libraries)
+
     return struct(
         config = config,
         exposed_packages = exposed_packages,
@@ -352,7 +463,7 @@ You cannot use both the additive_build_content and additive_build_content_file a
             }
             for hub_name in hub_whl_map
         },
-        simpleapi_cache = simpleapi_cache,
+        simpleapi_cache = filtered_cache,
     )
 
 def _pip_impl(module_ctx):
